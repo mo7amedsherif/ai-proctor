@@ -1,0 +1,1550 @@
+=== PATH: backend/server.js ===
+const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const connectDB = require("./config/db");
+const { errorHandler } = require("./middleware/errorMiddleware");
+
+dotenv.config();
+connectDB();
+
+const app = express();
+
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(",") || [],
+  credentials: true,
+}));
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", env: process.env.NODE_ENV });
+});
+
+app.use("/api/users",         require("./routes/userRoutes"));
+app.use("/api/exams",         require("./routes/examRoutes"));
+app.use("/api/results",       require("./routes/resultRoutes"));
+app.use("/api/cheating-logs", require("./routes/cheatingLogRoutes"));
+
+app.use(errorHandler);
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+=== END ===
+
+=== PATH: backend/config/db.js ===
+const mongoose = require("mongoose");
+
+const connectDB = async () => {
+  const conn = await mongoose.connect(process.env.MONGO_URI);
+  console.log(`MongoDB connected: ${conn.connection.host}`);
+};
+
+module.exports = connectDB;
+=== END ===
+
+=== PATH: backend/middleware/authMiddleware.js ===
+const jwt = require("jsonwebtoken");
+const asyncHandler = require("express-async-handler");
+const User = require("../models/userModel");
+
+// @desc  Verify JWT and attach user to req.user
+const protect = asyncHandler(async (req, res, next) => {
+  let token;
+
+  if (
+    req.headers.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+  ) {
+    token = req.headers.authorization.split(" ")[1];
+  }
+
+  if (!token) {
+    res.status(401);
+    throw new Error("Not authorized, no token provided");
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    res.status(401);
+    throw new Error("Not authorized, token is invalid or expired");
+  }
+
+  req.user = await User.findById(decoded.id).select("-password");
+
+  if (!req.user) {
+    res.status(401);
+    throw new Error("Not authorized, user no longer exists");
+  }
+
+  next();
+});
+
+// @desc  Restrict route to specific roles
+// Usage: authorizeRoles("teacher") or authorizeRoles("teacher", "admin")
+const authorizeRoles = (...roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      res.status(403);
+      throw new Error(
+        `Access denied — role '${req.user.role}' cannot access this route`
+      );
+    }
+    next();
+  };
+};
+
+module.exports = { protect, authorizeRoles };
+=== END ===
+
+=== PATH: backend/middleware/errorMiddleware.js ===
+const errorHandler = (err, req, res, next) => {
+  let statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  let message = err.message;
+
+  // Mongoose bad ObjectId (e.g. /api/exams/invalid-id)
+  if (err.name === "CastError" && err.kind === "ObjectId") {
+    statusCode = 404;
+    message = "Resource not found";
+  }
+
+  // Mongoose duplicate key (e.g. email already exists)
+  if (err.code === 11000) {
+    statusCode = 409;
+    const field = Object.keys(err.keyValue)[0];
+    message = `A user with this ${field} already exists`;
+  }
+
+  // Mongoose validation error (e.g. required field missing)
+  if (err.name === "ValidationError") {
+    statusCode = 400;
+    message = Object.values(err.errors)
+      .map((e) => e.message)
+      .join(", ");
+  }
+
+  res.status(statusCode).json({
+    message,
+    stack: process.env.NODE_ENV === "production" ? null : err.stack,
+  });
+};
+
+module.exports = { errorHandler };
+=== END ===
+
+=== PATH: backend/models/userModel.js ===
+const mongoose = require("mongoose");
+const bcrypt = require("bcryptjs");
+
+const userSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      required: [true, "Name is required"],
+      trim: true,
+    },
+    email: {
+      type: String,
+      required: [true, "Email is required"],
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    password: {
+      type: String,
+      required: [true, "Password is required"],
+      minlength: [6, "Password must be at least 6 characters"],
+    },
+    role: {
+      type: String,
+      enum: ["student", "teacher"],
+      default: "student",
+    },
+  },
+  { timestamps: true }
+);
+
+// Mongoose 7+ — no next parameter
+userSchema.pre("save", async function () {
+  if (!this.isModified("password")) return;
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+});
+
+userSchema.methods.matchPassword = async function (enteredPassword) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
+
+module.exports = mongoose.model("User", userSchema);
+=== END ===
+
+=== PATH: backend/models/examModel.js ===
+const mongoose = require("mongoose");
+
+const examSchema = new mongoose.Schema(
+  {
+    title: {
+      type: String,
+      required: [true, "Exam title is required"],
+      trim: true,
+    },
+    description: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    duration: {
+      type: Number,
+      required: [true, "Exam duration is required"],
+      min: [1, "Duration must be at least 1 minute"],
+    },
+    teacher: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model("Exam", examSchema);
+=== END ===
+
+=== PATH: backend/models/questionModel.js ===
+const mongoose = require("mongoose");
+
+const questionSchema = new mongoose.Schema(
+  {
+    exam: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Exam",
+      required: true,
+    },
+    text: {
+      type: String,
+      required: [true, "Question text is required"],
+      trim: true,
+    },
+    options: {
+      type: [String],
+      validate: {
+        validator: (val) => val.length === 4,
+        message: "Each question must have exactly 4 options",
+      },
+    },
+    correctOption: {
+      type: Number,
+      required: [true, "Correct option index is required"],
+      min: 0,
+      max: 3,
+    },
+    marks: {
+      type: Number,
+      default: 1,
+      min: 1,
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model("Question", questionSchema);
+=== END ===
+
+=== PATH: backend/models/resultModel.js ===
+const mongoose = require("mongoose");
+
+const resultSchema = new mongoose.Schema(
+  {
+    student: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    exam: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Exam",
+      required: true,
+    },
+    answers: [
+      {
+        question: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Question",
+        },
+        selectedOption: {
+          type: Number,
+          default: null,
+        },
+      },
+    ],
+    score:      { type: Number, default: 0 },
+    totalMarks: { type: Number, default: 0 },
+    percentage: { type: Number, default: 0 },
+    submittedAt:{ type: Date,   default: Date.now },
+  },
+  { timestamps: true }
+);
+
+// Prevent double submission
+resultSchema.index({ student: 1, exam: 1 }, { unique: true });
+
+module.exports = mongoose.model("Result", resultSchema);
+=== END ===
+
+=== PATH: backend/models/cheatingLogModel.js ===
+const mongoose = require("mongoose");
+
+const cheatingLogSchema = new mongoose.Schema(
+  {
+    student: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    exam: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Exam",
+      required: true,
+    },
+    type: {
+      type: String,
+      required: true,
+      enum: [
+        "tab_switch",
+        "fullscreen_exit",
+        "camera_obstruction",
+        "microphone_muted",
+        "multiple_faces",
+        "no_face_detected",
+        "phone_detected",
+        "unauthorized_device",
+        "suspicious_movement",
+        "copy_paste_attempt",
+        "right_click_attempt",
+        "keyboard_shortcut",
+        "browser_dev_tools",
+        "screen_recording",
+        "unauthorized_access",
+        "time_anomaly",
+        "answer_pattern_anomaly",
+        "other",
+      ],
+    },
+    severity: {
+      type: String,
+      enum: ["low", "medium", "high", "critical"],
+      default: "medium",
+    },
+    confidence: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: null,
+    },
+    description: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    timestamp: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { timestamps: true }
+);
+
+cheatingLogSchema.index({ student: 1, exam: 1 });
+cheatingLogSchema.index({ exam: 1, type: 1 });
+cheatingLogSchema.index({ timestamp: -1 });
+
+module.exports = mongoose.model("CheatingLog", cheatingLogSchema);
+=== END ===
+
+=== PATH: backend/controllers/userController.js ===
+const asyncHandler = require("express-async-handler");
+const User = require("../models/userModel");
+const generateToken = require("../utils/generateToken");
+
+// @desc    Register new user
+// @route   POST /api/users/register
+// @access  Public
+const registerUser = asyncHandler(async (req, res) => {
+  const { name, email, password, role } = req.body;
+
+  if (!name || !email || !password) {
+    res.status(400);
+    throw new Error("Please provide name, email and password");
+  }
+
+  const userExists = await User.findOne({ email });
+  if (userExists) {
+    res.status(409);
+    throw new Error("A user with this email already exists");
+  }
+
+  const user = await User.create({ name, email, password, role });
+
+  res.status(201).json({
+    _id:   user._id,
+    name:  user.name,
+    email: user.email,
+    role:  user.role,
+    token: generateToken(user._id, user.role),
+  });
+});
+
+// @desc    Login user
+// @route   POST /api/users/login
+// @access  Public
+const loginUser = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    res.status(400);
+    throw new Error("Please provide email and password");
+  }
+
+  const user = await User.findOne({ email });
+
+  if (!user || !(await user.matchPassword(password))) {
+    res.status(401);
+    throw new Error("Invalid email or password");
+  }
+
+  res.json({
+    _id:   user._id,
+    name:  user.name,
+    email: user.email,
+    role:  user.role,
+    token: generateToken(user._id, user.role),
+  });
+});
+
+// @desc    Get current logged-in user profile
+// @route   GET /api/users/me
+// @access  Private
+const getMe = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user.id).select("-password");
+  if (!user) {
+    res.status(404);
+    throw new Error("User not found");
+  }
+  res.json(user);
+});
+
+module.exports = { registerUser, loginUser, getMe };
+=== END ===
+
+=== PATH: backend/controllers/examController.js ===
+const asyncHandler = require("express-async-handler");
+const Exam = require("../models/examModel");
+const Question = require("../models/questionModel");
+
+// @desc   Create a new exam
+// @route  POST /api/exams
+// @access Teacher only
+const createExam = asyncHandler(async (req, res) => {
+  const { title, description, duration } = req.body;
+
+  if (!title || !duration) {
+    res.status(400);
+    throw new Error("Please provide title and duration");
+  }
+
+  const exam = await Exam.create({
+    title,
+    description,
+    duration,
+    teacher: req.user._id,
+  });
+
+  res.status(201).json(exam);
+});
+
+// @desc   Get all exams
+// @route  GET /api/exams
+// @access Teacher gets own exams — Student gets all active exams
+const getExams = asyncHandler(async (req, res) => {
+  let exams;
+
+  if (req.user.role === "teacher") {
+    exams = await Exam.find({ teacher: req.user._id }).sort("-createdAt");
+  } else {
+    exams = await Exam.find({ isActive: true })
+      .populate("teacher", "name email")
+      .sort("-createdAt");
+  }
+
+  res.json(exams);
+});
+
+// @desc   Get single exam by ID
+// @route  GET /api/exams/:id
+// @access Private
+const getExamById = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.id).populate(
+    "teacher",
+    "name email"
+  );
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  res.json(exam);
+});
+
+// @desc   Update exam
+// @route  PUT /api/exams/:id
+// @access Teacher only (own exams)
+const updateExam = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.id);
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to update this exam");
+  }
+
+  const { title, description, duration, isActive } = req.body;
+  exam.title       = title       ?? exam.title;
+  exam.description = description ?? exam.description;
+  exam.duration    = duration    ?? exam.duration;
+  exam.isActive    = isActive    ?? exam.isActive;
+
+  const updated = await exam.save();
+  res.json(updated);
+});
+
+// @desc   Delete exam and its questions
+// @route  DELETE /api/exams/:id
+// @access Teacher only (own exams)
+const deleteExam = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.id);
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to delete this exam");
+  }
+
+  await Question.deleteMany({ exam: exam._id });
+  await exam.deleteOne();
+
+  res.json({ message: "Exam and its questions deleted successfully" });
+});
+
+module.exports = {
+  createExam,
+  getExams,
+  getExamById,
+  updateExam,
+  deleteExam,
+};
+=== END ===
+
+=== PATH: backend/controllers/questionController.js ===
+const asyncHandler = require("express-async-handler");
+const Question = require("../models/questionModel");
+const Exam = require("../models/examModel");
+
+// @desc   Add question to an exam
+// @route  POST /api/exams/:examId/questions
+// @access Teacher only (own exams)
+const addQuestion = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to add questions to this exam");
+  }
+
+  const { text, options, correctOption, marks } = req.body;
+
+  if (!text || !options || correctOption === undefined) {
+    res.status(400);
+    throw new Error("Please provide text, options and correctOption");
+  }
+
+  const question = await Question.create({
+    exam: exam._id,
+    text,
+    options,
+    correctOption,
+    marks,
+  });
+
+  res.status(201).json(question);
+});
+
+// @desc   Get all questions for an exam
+// @route  GET /api/exams/:examId/questions
+// @access Private
+// @note   Students do NOT get correctOption
+const getQuestions = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  const questions = await Question.find({ exam: req.params.examId });
+
+  // Hide correct answer from students
+  if (req.user.role === "student") {
+    const sanitized = questions.map((q) => ({
+      _id:          q._id,
+      text:         q.text,
+      options:      q.options,
+      marks:        q.marks,
+    }));
+    return res.json(sanitized);
+  }
+
+  res.json(questions);
+});
+
+// @desc   Delete a question
+// @route  DELETE /api/exams/:examId/questions/:questionId
+// @access Teacher only (own exams)
+const deleteQuestion = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to delete questions from this exam");
+  }
+
+  const question = await Question.findById(req.params.questionId);
+  
+  if (!question) {
+    res.status(404);
+    throw new Error('Question not found');
+  }
+
+  if (question.exam.toString() !== req.params.examId) {
+    res.status(400);
+    throw new Error('Question does not belong to this exam');
+  }
+
+  await question.deleteOne();
+  res.json({ message: 'Question deleted successfully' });
+});
+
+// @desc   Create standalone question
+// @route  POST /api/questions
+// @access Teacher only
+const createQuestion = asyncHandler(async (req, res) => {
+  const { text, options, correctOption, marks, exam } = req.body;
+
+  if (!text || !options || correctOption === undefined) {
+    res.status(400);
+    throw new Error("Please provide text, options and correctOption");
+  }
+
+  // If exam is provided, verify it exists and user owns it
+  if (exam) {
+    const examDoc = await Exam.findById(exam);
+    if (!examDoc) {
+      res.status(404);
+      throw new Error("Exam not found");
+    }
+    if (examDoc.teacher.toString() !== req.user._id.toString()) {
+      res.status(403);
+      throw new Error("Not authorized to add questions to this exam");
+    }
+  }
+
+  const question = await Question.create({
+    exam,
+    text,
+    options,
+    correctOption,
+    marks,
+  });
+
+  res.status(201).json(question);
+});
+
+// @desc   Get single question
+// @route  GET /api/questions/:id
+// @access Private
+const getQuestion = asyncHandler(async (req, res) => {
+  const question = await Question.findById(req.params.id).populate('exam', 'title');
+
+  if (!question) {
+    res.status(404);
+    throw new Error('Question not found');
+  }
+
+  // Check permissions
+  if (question.exam) {
+    const exam = await Exam.findById(question.exam);
+    if (req.user.role === 'student' && (!exam.isPublished || !exam.isActive)) {
+      res.status(403);
+      throw new Error('Question not available');
+    }
+    if (req.user.role === 'teacher' && exam.teacher.toString() !== req.user.id) {
+      res.status(403);
+      throw new Error('Not authorized to view this question');
+    }
+  }
+
+  // Hide correct answer from students
+  if (req.user.role === 'student') {
+    const sanitized = {
+      _id: question._id,
+      text: question.text,
+      options: question.options,
+      marks: question.marks,
+      exam: question.exam,
+    };
+    return res.json(sanitized);
+  }
+
+  res.json(question);
+});
+
+// @desc   Update question
+// @route  PUT /api/questions/:id
+// @access Teacher only
+const updateQuestion = asyncHandler(async (req, res) => {
+  const question = await Question.findById(req.params.id);
+
+  if (!question) {
+    res.status(404);
+    throw new Error('Question not found');
+  }
+
+  // Check permissions
+  if (question.exam) {
+    const exam = await Exam.findById(question.exam);
+    if (!exam) {
+      res.status(404);
+      throw new Error('Associated exam not found');
+    }
+    if (exam.teacher.toString() !== req.user.id) {
+      res.status(403);
+      throw new Error('Not authorized to update this question');
+    }
+  }
+
+  const { text, options, correctOption, marks } = req.body;
+  question.text = text || question.text;
+  question.options = options || question.options;
+  question.correctOption = correctOption !== undefined ? correctOption : question.correctOption;
+  question.marks = marks || question.marks;
+
+  const updatedQuestion = await question.save();
+  res.json(updatedQuestion);
+});
+
+// @desc   Toggle question activation
+// @route  PATCH /api/questions/:id/activate
+// @access Teacher only
+const toggleActivateQuestion = asyncHandler(async (req, res) => {
+  const question = await Question.findById(req.params.id);
+
+  if (!question) {
+    res.status(404);
+    throw new Error('Question not found');
+  }
+
+  // Check permissions
+  if (question.exam) {
+    const exam = await Exam.findById(question.exam);
+    if (!exam) {
+      res.status(404);
+      throw new Error('Associated exam not found');
+    }
+    if (exam.teacher.toString() !== req.user.id) {
+      res.status(403);
+      throw new Error('Not authorized to modify this question');
+    }
+  }
+
+  question.isActive = !question.isActive;
+  await question.save();
+
+  res.json({ 
+    message: `Question ${question.isActive ? 'activated' : 'deactivated'} successfully`,
+    isActive: question.isActive
+  });
+});
+
+// @desc   Get questions by category
+// @route  GET /api/questions/category/:category
+// @access Private
+const getQuestionsByCategory = asyncHandler(async (req, res) => {
+  const { category } = req.params;
+  
+  let query = {};
+  
+  // Add category filter if we had category field in schema
+  // For now, we'll return all questions since schema doesn't have category
+  
+  // Role-based filtering
+  if (req.user.role === 'student') {
+    // Students can only see questions from active/published exams
+    const activeExams = await Exam.find({ isActive: true, isPublished: true }).select('_id');
+    query.exam = { $in: activeExams.map(e => e._id) };
+  } else if (req.user.role === 'teacher') {
+    // Teachers can see questions from their own exams
+    const teacherExams = await Exam.find({ teacher: req.user.id }).select('_id');
+    query.exam = { $in: teacherExams.map(e => e._id) };
+  }
+
+  const questions = await Question.find(query)
+    .populate('exam', 'title')
+    .sort({ createdAt: -1 });
+
+  // Hide correct answers from students
+  if (req.user.role === 'student') {
+    const sanitized = questions.map((q) => ({
+      _id: q._id,
+      text: q.text,
+      options: q.options,
+      marks: q.marks,
+      exam: q.exam,
+    }));
+    return res.json(sanitized);
+  }
+
+  res.json(questions);
+});
+
+// @desc   Get questions by type
+// @route  GET /api/questions/type/:type
+// @access Private
+const getQuestionsByType = asyncHandler(async (req, res) => {
+  const { type } = req.params;
+  
+  let query = {};
+  
+  // Role-based filtering
+  if (req.user.role === 'student') {
+    // Students can only see questions from active/published exams
+    const activeExams = await Exam.find({ isActive: true, isPublished: true }).select('_id');
+    query.exam = { $in: activeExams.map(e => e._id) };
+  } else if (req.user.role === 'teacher') {
+    // Teachers can see questions from their own exams
+    const teacherExams = await Exam.find({ teacher: req.user.id }).select('_id');
+    query.exam = { $in: teacherExams.map(e => e._id) };
+  }
+
+  const questions = await Question.find(query)
+    .populate('exam', 'title')
+    .sort({ createdAt: -1 });
+
+  // Hide correct answers from students
+  if (req.user.role === 'student') {
+    const sanitized = questions.map((q) => ({
+      _id: q._id,
+      text: q.text,
+      options: q.options,
+      marks: q.marks,
+      exam: q.exam,
+    }));
+    return res.json(sanitized);
+  }
+
+  res.json(questions);
+});
+
+module.exports = { 
+  addQuestion, 
+  getQuestions, 
+  deleteQuestion,
+  createQuestion,
+  getQuestion,
+  updateQuestion,
+  toggleActivateQuestion,
+  getQuestionsByCategory,
+  getQuestionsByType,
+};
+=== END ===
+
+=== PATH: backend/controllers/resultController.js ===
+const asyncHandler = require("express-async-handler");
+const Result = require("../models/resultModel");
+const Exam = require("../models/examModel");
+const calculateMarks = require("../utils/calculateMarks");
+
+// @desc   Submit exam answers and calculate score
+// @route  POST /api/results
+// @access Student only
+const submitExam = asyncHandler(async (req, res) => {
+  const { examId, answers } = req.body;
+
+  if (!examId || !answers || !Array.isArray(answers)) {
+    res.status(400);
+    throw new Error("Please provide examId and answers array");
+  }
+
+  const exam = await Exam.findById(examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  const existing = await Result.findOne({
+    student: req.user._id,
+    exam: examId,
+  });
+  if (existing) {
+    res.status(409);
+    throw new Error("You have already submitted this exam");
+  }
+
+  const { score, totalMarks, percentage } = await calculateMarks(
+    examId,
+    answers
+  );
+
+  const result = await Result.create({
+    student: req.user._id,
+    exam: examId,
+    answers,
+    score,
+    totalMarks,
+    percentage,
+  });
+
+  res.status(201).json({
+    _id: result._id,
+    score,
+    totalMarks,
+    percentage,
+    submittedAt: result.submittedAt,
+  });
+});
+
+// @desc   Get current student's results
+// @route  GET /api/results/my
+// @access Student only
+const getMyResults = asyncHandler(async (req, res) => {
+  const results = await Result.find({ student: req.user._id })
+    .populate("exam", "title duration")
+    .sort("-submittedAt");
+  res.json(results);
+});
+
+// @desc   Get all results for a specific exam
+// @route  GET /api/results/exam/:examId
+// @access Teacher only (own exams)
+const getExamResults = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to view results for this exam");
+  }
+
+  const results = await Result.find({ exam: req.params.examId })
+    .populate("student", "name email")
+    .sort("-submittedAt");
+  res.json(results);
+});
+
+module.exports = { submitExam, getMyResults, getExamResults };
+=== END ===
+
+=== PATH: backend/controllers/cheatingLogController.js ===
+const asyncHandler = require("express-async-handler");
+const CheatingLog = require("../models/cheatingLogModel");
+const Exam = require("../models/examModel");
+
+// Severity map — auto-assign if not provided by client
+const SEVERITY_MAP = {
+  tab_switch:             "medium",
+  fullscreen_exit:        "low",
+  camera_obstruction:     "high",
+  microphone_muted:       "low",
+  multiple_faces:         "critical",
+  no_face_detected:       "high",
+  phone_detected:         "critical",
+  unauthorized_device:    "critical",
+  suspicious_movement:    "medium",
+  copy_paste_attempt:     "medium",
+  right_click_attempt:    "low",
+  keyboard_shortcut:      "medium",
+  browser_dev_tools:      "high",
+  screen_recording:       "critical",
+  unauthorized_access:    "critical",
+  time_anomaly:           "high",
+  answer_pattern_anomaly: "high",
+  other:                  "medium",
+};
+
+// @desc   Log a cheating event from proctoring engine
+// @route  POST /api/cheating-logs
+// @access Student only
+const logCheatingEvent = asyncHandler(async (req, res) => {
+  const { examId, type, confidence, description } = req.body;
+
+  if (!examId || !type) {
+    res.status(400);
+    throw new Error("Please provide examId and type");
+  }
+
+  const exam = await Exam.findById(examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  const log = await CheatingLog.create({
+    student:     req.user._id,
+    exam:        examId,
+    type,
+    severity:    SEVERITY_MAP[type] || "medium",
+    confidence:  confidence ?? null,
+    description: description || "",
+  });
+
+  res.status(201).json(log);
+});
+
+// @desc   Get all cheating logs for an exam
+// @route  GET /api/cheating-logs/exam/:examId
+// @access Teacher only (own exams)
+const getExamCheatingLogs = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to view cheating logs for this exam");
+  }
+
+  const { type, severity } = req.query;
+  const filter = { exam: req.params.examId };
+  if (type)     filter.type = type;
+  if (severity) filter.severity = severity;
+
+  const logs = await CheatingLog.find(filter)
+    .populate("student", "name email")
+    .sort("-timestamp");
+
+  res.json(logs);
+});
+
+// @desc   Get cheating logs for one student in one exam
+// @route  GET /api/cheating-logs/exam/:examId/student/:studentId
+// @access Teacher only (own exams)
+const getStudentCheatingLogs = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized to view these logs");
+  }
+
+  const logs = await CheatingLog.find({
+    exam:    req.params.examId,
+    student: req.params.studentId,
+  })
+    .populate("student", "name email")
+    .sort("-timestamp");
+
+  res.json(logs);
+});
+
+// @desc   Get cheating summary per student for an exam
+// @route  GET /api/cheating-logs/exam/:examId/summary
+// @access Teacher only (own exams)
+const getExamCheatingSummary = asyncHandler(async (req, res) => {
+  const exam = await Exam.findById(req.params.examId);
+  if (!exam) {
+    res.status(404);
+    throw new Error("Exam not found");
+  }
+
+  if (exam.teacher.toString() !== req.user._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized");
+  }
+
+  const summary = await CheatingLog.aggregate([
+    { $match: { exam: exam._id } },
+    {
+      $group: {
+        _id:      "$student",
+        total:    { $sum: 1 },
+        critical: { $sum: { $cond: [{ $eq: ["$severity", "critical"] }, 1, 0] } },
+        high:     { $sum: { $cond: [{ $eq: ["$severity", "high"] }, 1, 0] } },
+        types:    { $addToSet: "$type" },
+      },
+    },
+    {
+      $lookup: {
+        from:         "users",
+        localField:   "_id",
+        foreignField: "_id",
+        as:           "student",
+      },
+    },
+    { $unwind: "$student" },
+    {
+      $project: {
+        student: { name: 1, email: 1 },
+        total:   1,
+        critical:1,
+        high:    1,
+        types:   1,
+      },
+    },
+    { $sort: { critical: -1, total: -1 } },
+  ]);
+
+  res.json(summary);
+});
+
+module.exports = {
+  logCheatingEvent,
+  getExamCheatingLogs,
+  getStudentCheatingLogs,
+  getExamCheatingSummary,
+};
+=== END ===
+
+=== PATH: backend/controllers/codeController.js ===
+const asyncHandler = require('express-async-handler');
+const axios = require('axios');
+
+// @desc    Run code via Judge0 API
+// @route   POST /api/code/run
+// @access  Private
+const runCode = asyncHandler(async (req, res) => {
+  const {
+    source_code,
+    language_id = 71, // Python default
+    stdin = '',
+    expected_output = '',
+    cpu_time_limit = 2,
+    memory_limit = 128000,
+    additional_files = []
+  } = req.body;
+
+  if (!source_code) {
+    res.status(400);
+    throw new Error('Source code is required');
+  }
+
+  try {
+    const response = await axios.post(
+      `${process.env.JUDGE0_API_URL}/submissions`,
+      {
+        source_code,
+        language_id,
+        stdin,
+        expected_output,
+        cpu_time_limit,
+        memory_limit,
+        additional_files
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
+          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+        }
+      }
+    );
+
+    // Poll for results
+    const token = response.data.token;
+    let result = await getSubmissionResult(token);
+    
+    // If still processing, wait and poll again
+    let attempts = 0;
+    while (result.status.id <= 2 && attempts < 10) { // 1=Queued, 2=Processing
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      result = await getSubmissionResult(token);
+      attempts++;
+    }
+
+    res.json({
+      token,
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      compile_output: result.compile_output,
+      time: result.time,
+      memory: result.memory,
+      exit_code: result.exit_code
+    });
+
+  } catch (error) {
+    console.error('Judge0 API Error:', error.response?.data || error.message);
+    res.status(500);
+    throw new Error('Code execution failed');
+  }
+});
+
+// @desc    Get supported languages
+// @route   GET /api/code/languages
+// @access  Private
+const getLanguages = asyncHandler(async (req, res) => {
+  try {
+    const response = await axios.get(
+      `${process.env.JUDGE0_API_URL}/languages`,
+      {
+        headers: {
+          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
+          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+        }
+      }
+    );
+
+    res.json(response.data);
+  } catch (error) {
+    console.error('Judge0 Languages API Error:', error.response?.data || error.message);
+    res.status(500);
+    throw new Error('Failed to fetch languages');
+  }
+});
+
+// @desc    Get submission status
+// @route   GET /api/code/submissions/:token
+// @access  Private
+const getSubmissionStatus = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+
+  try {
+    const result = await getSubmissionResult(token);
+    res.json(result);
+  } catch (error) {
+    console.error('Judge0 Submission API Error:', error.response?.data || error.message);
+    res.status(500);
+    throw new Error('Failed to get submission status');
+  }
+});
+
+// @desc    Health check for code execution service
+// @route   GET /api/code/health
+// @access  Private
+const healthCheck = asyncHandler(async (req, res) => {
+  try {
+    // Test Judge0 API availability
+    const response = await axios.get(
+      `${process.env.JUDGE0_API_URL}/system`,
+      {
+        headers: {
+          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
+          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+        },
+        timeout: 5000
+      }
+    );
+
+    res.json({
+      status: 'healthy',
+      judge0_status: 'connected',
+      timestamp: new Date().toISOString(),
+      system_info: response.data
+    });
+  } catch (error) {
+    res.json({
+      status: 'unhealthy',
+      judge0_status: 'disconnected',
+      timestamp: new Date().toISOString(),
+      error: error.message
+    });
+  }
+});
+
+// Helper function to get submission result
+const getSubmissionResult = async (token) => {
+  const response = await axios.get(
+    `${process.env.JUDGE0_API_URL}/submissions/${token}`,
+    {
+      headers: {
+        'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
+        'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+      }
+    }
+  );
+  return response.data;
+};
+
+module.exports = {
+  runCode,
+  getLanguages,
+  getSubmissionStatus,
+  healthCheck
+};
+=== END ===
+
+=== PATH: backend/routes/userRoutes.js ===
+const express = require("express");
+const router = express.Router();
+const { registerUser, loginUser, getMe } = require("../controllers/userController");
+const { protect } = require("../middleware/authMiddleware");
+
+router.post("/register", registerUser);
+router.post("/login",    loginUser);
+router.get("/me",        protect, getMe);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/routes/examRoutes.js ===
+const express = require("express");
+const router = express.Router();
+const {
+  createExam,
+  getExams,
+  getExamById,
+  updateExam,
+  deleteExam,
+} = require("../controllers/examController");
+
+const {
+  addQuestion,
+  getQuestions,
+  deleteQuestion,
+} = require("../controllers/questionController");
+const { protect, authorizeRoles } = require("../middleware/authMiddleware");
+
+router.use(protect);
+
+router.route("/")
+  .get(getExams)
+  .post(authorizeRoles("teacher"), createExam);
+
+router.route("/:id")
+  .get(getExamById)
+  .put(authorizeRoles("teacher"), updateExam)
+  .delete(authorizeRoles("teacher"), deleteExam);
+
+router.route("/:examId/questions")
+  .get(getQuestions)
+  .post(authorizeRoles("teacher"), addQuestion);
+
+router.route("/:examId/questions/:questionId")
+  .delete(authorizeRoles("teacher"), deleteQuestion);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/routes/questionRoutes.js ===
+const express = require('express');
+const router = express.Router();
+const {
+    createQuestion,
+    getQuestions,
+    getQuestion,
+    updateQuestion,
+    deleteQuestion,
+    toggleActivateQuestion,
+    getQuestionsByCategory,
+    getQuestionsByType,
+} = require('../controllers/questionController');
+const { protect, authorizeRoles } = require('../middleware/authMiddleware');
+
+// All routes are protected
+router.use(protect);
+
+// Routes accessible by teachers and admins
+router.post('/', authorizeRoles('teacher', 'admin'), createQuestion);
+router.get('/', getQuestions);
+router.get('/category/:category', getQuestionsByCategory);
+router.get('/type/:type', getQuestionsByType);
+router.get('/:id', getQuestion);
+router.put('/:id', authorizeRoles('teacher', 'admin'), updateQuestion);
+router.delete('/:id', authorizeRoles('teacher', 'admin'), deleteQuestion);
+
+// Toggle question status route
+router.patch('/:id/activate', authorizeRoles('teacher', 'admin'), toggleActivateQuestion);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/routes/resultRoutes.js ===
+const express = require("express");
+const router = express.Router();
+const {
+  submitExam,
+  getMyResults,
+  getExamResults,
+} = require("../controllers/resultController");
+const { protect, authorizeRoles } = require("../middleware/authMiddleware");
+
+router.use(protect);
+
+router.post("/",              authorizeRoles("student"), submitExam);
+router.get("/my",             authorizeRoles("student"), getMyResults);
+router.get("/exam/:examId",   authorizeRoles("teacher"), getExamResults);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/routes/cheatingLogRoutes.js ===
+const express = require("express");
+const router = express.Router();
+const {
+  logCheatingEvent,
+  getExamCheatingLogs,
+  getStudentCheatingLogs,
+  getExamCheatingSummary,
+} = require("../controllers/cheatingLogController");
+const { protect, authorizeRoles } = require("../middleware/authMiddleware");
+
+router.use(protect);
+
+router.post("/",
+  authorizeRoles("student"),
+  logCheatingEvent
+);
+
+router.get("/exam/:examId",
+  authorizeRoles("teacher"),
+  getExamCheatingLogs
+);
+
+router.get("/exam/:examId/summary",
+  authorizeRoles("teacher"),
+  getExamCheatingSummary
+);
+
+router.get("/exam/:examId/student/:studentId",
+  authorizeRoles("teacher"),
+  getStudentCheatingLogs
+);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/routes/codeRoutes.js ===
+const express = require('express');
+const { protect } = require('../middleware/authMiddleware');
+const {
+  runCode,
+  getLanguages,
+  getSubmissionStatus,
+  healthCheck
+} = require('../controllers/codeController');
+
+const router = express.Router();
+
+// All routes are protected
+router.use(protect);
+
+// @desc    Run code via Judge0 API
+// @route   POST /api/code/run
+// @access  Private
+router.post('/run', runCode);
+
+// @desc    Get supported languages
+// @route   GET /api/code/languages
+// @access  Private
+router.get('/languages', getLanguages);
+
+// @desc    Get submission status
+// @route   GET /api/code/submissions/:token
+// @access  Private
+router.get('/submissions/:token', getSubmissionStatus);
+
+// @desc    Health check for code execution service
+// @route   GET /api/code/health
+// @access  Private
+router.get('/health', healthCheck);
+
+module.exports = router;
+=== END ===
+
+=== PATH: backend/utils/generateToken.js ===
+const jwt = require("jsonwebtoken");
+
+const generateToken = (id, role) => {
+  return jwt.sign({ id, role }, process.env.JWT_SECRET, {
+    expiresIn: "7d",
+  });
+};
+
+module.exports = generateToken;
+=== END ===
+
+=== PATH: backend/utils/calculateMarks.js ===
+const Question = require("../models/questionModel");
+
+const calculateMarks = async (examId, answers) => {
+    const questions = await Question.find({ exam: examId });
+
+    let score = 0;
+    let totalMarks = 0;
+
+    for (const question of questions) {
+        totalMarks += question.marks;
+        const submitted = answers.find(
+            (a) => a.question.toString() === question._id.toString()
+        );
+        if (
+            submitted &&
+            submitted.selectedOption !== null &&
+            submitted.selectedOption === question.correctOption
+        ) {
+            score += question.marks;
+        }
+    }
+
+    const percentage =
+        totalMarks > 0 ? Math.round((score / totalMarks) * 100) : 0;
+
+    return { score, totalMarks, percentage };
+};
+
+module.exports = calculateMarks;
+=== END ===
+
+=== PATH: backend/.env ===
+NODE_ENV=development
+PORT=5000
+MONGO_URI=mongodb://127.0.0.1:27017/ai-proctor
+JWT_SECRET=all password 15891741 for $%&!@ god protection 
+ALLOWED_ORIGINS=http://localhost:5173
+
+# Judge0 API Configuration
+JUDGE0_API_URL=https://judge0-ce.p.rapidapi.com
+JUDGE0_API_KEY=your_rapidapi_key_here
+=== END ===
