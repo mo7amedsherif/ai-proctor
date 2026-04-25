@@ -17,20 +17,22 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-
+//for checking if the server is running or not
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", env: process.env.NODE_ENV });
 });
-
+//api fpr project 
 app.use("/api/users",         require("./routes/userRoutes"));
 app.use("/api/exams",         require("./routes/examRoutes"));
 app.use("/api/results",       require("./routes/resultRoutes"));
 app.use("/api/cheating-logs", require("./routes/cheatingLogRoutes"));
+app.use("/api/code", require("./routes/codeRoutes"));
 
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}
+  and  url is http://localhost:5000`));
 === END ===
 
 === PATH: backend/config/db.js ===
@@ -1008,7 +1010,7 @@ const SEVERITY_MAP = {
   other:                  "medium",
 };
 
-// @desc   Log a cheating event from proctoring engine
+// @desc   Log a cheating event from the proctoring engine
 // @route  POST /api/cheating-logs
 // @access Student only
 const logCheatingEvent = asyncHandler(async (req, res) => {
@@ -1148,171 +1150,107 @@ module.exports = {
 === END ===
 
 === PATH: backend/controllers/codeController.js ===
-const asyncHandler = require('express-async-handler');
-const axios = require('axios');
+const asyncHandler = require("express-async-handler");
+const axios = require("axios");
 
-// @desc    Run code via Judge0 API
-// @route   POST /api/code/run
-// @access  Private
+// Judge0 language ID map
+const LANGUAGE_IDS = {
+  python:     71,
+  javascript: 63,
+  java:       62,
+  cpp:        54,
+  c:          50,
+};
+
+// @desc   Submit code to Judge0 and return result
+// @route  POST /api/code/run
+// @access Private (any authenticated user)
 const runCode = asyncHandler(async (req, res) => {
-  const {
-    source_code,
-    language_id = 71, // Python default
-    stdin = '',
-    expected_output = '',
-    cpu_time_limit = 2,
-    memory_limit = 128000,
-    additional_files = []
-  } = req.body;
+  const { code, language, stdin } = req.body;
 
-  if (!source_code) {
+  if (!code || !language) {
     res.status(400);
-    throw new Error('Source code is required');
+    throw new Error("Please provide code and language");
   }
 
-  try {
-    const response = await axios.post(
-      `${process.env.JUDGE0_API_URL}/submissions`,
-      {
-        source_code,
-        language_id,
-        stdin,
-        expected_output,
-        cpu_time_limit,
-        memory_limit,
-        additional_files
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
-          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
-        }
-      }
+  const languageId = LANGUAGE_IDS[language.toLowerCase()];
+
+  if (!languageId) {
+    res.status(400);
+    throw new Error(
+      `Unsupported language '${language}'. Supported: ${Object.keys(LANGUAGE_IDS).join(", ")}`
     );
-
-    // Poll for results
-    const token = response.data.token;
-    let result = await getSubmissionResult(token);
-    
-    // If still processing, wait and poll again
-    let attempts = 0;
-    while (result.status.id <= 2 && attempts < 10) { // 1=Queued, 2=Processing
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      result = await getSubmissionResult(token);
-      attempts++;
-    }
-
-    res.json({
-      token,
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      compile_output: result.compile_output,
-      time: result.time,
-      memory: result.memory,
-      exit_code: result.exit_code
-    });
-
-  } catch (error) {
-    console.error('Judge0 API Error:', error.response?.data || error.message);
-    res.status(500);
-    throw new Error('Code execution failed');
   }
-});
 
-// @desc    Get supported languages
-// @route   GET /api/code/languages
-// @access  Private
-const getLanguages = asyncHandler(async (req, res) => {
-  try {
-    const response = await axios.get(
-      `${process.env.JUDGE0_API_URL}/languages`,
-      {
-        headers: {
-          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
-          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
-        }
-      }
-    );
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('Judge0 Languages API Error:', error.response?.data || error.message);
-    res.status(500);
-    throw new Error('Failed to fetch languages');
-  }
-});
-
-// @desc    Get submission status
-// @route   GET /api/code/submissions/:token
-// @access  Private
-const getSubmissionStatus = asyncHandler(async (req, res) => {
-  const { token } = req.params;
-
-  try {
-    const result = await getSubmissionResult(token);
-    res.json(result);
-  } catch (error) {
-    console.error('Judge0 Submission API Error:', error.response?.data || error.message);
-    res.status(500);
-    throw new Error('Failed to get submission status');
-  }
-});
-
-// @desc    Health check for code execution service
-// @route   GET /api/code/health
-// @access  Private
-const healthCheck = asyncHandler(async (req, res) => {
-  try {
-    // Test Judge0 API availability
-    const response = await axios.get(
-      `${process.env.JUDGE0_API_URL}/system`,
-      {
-        headers: {
-          'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
-          'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
-        },
-        timeout: 5000
-      }
-    );
-
-    res.json({
-      status: 'healthy',
-      judge0_status: 'connected',
-      timestamp: new Date().toISOString(),
-      system_info: response.data
-    });
-  } catch (error) {
-    res.json({
-      status: 'unhealthy',
-      judge0_status: 'disconnected',
-      timestamp: new Date().toISOString(),
-      error: error.message
-    });
-  }
-});
-
-// Helper function to get submission result
-const getSubmissionResult = async (token) => {
-  const response = await axios.get(
-    `${process.env.JUDGE0_API_URL}/submissions/${token}`,
+  // Step 1 — Submit code to Judge0 (returns a token)
+  const submitResponse = await axios.post(
+    `${process.env.JUDGE0_API_URL}/submissions?base64_encoded=false&wait=false`,
+    {
+      source_code: code,
+      language_id: languageId,
+      stdin: stdin || "",
+    },
     {
       headers: {
-        'X-RapidAPI-Key': process.env.JUDGE0_API_KEY,
-        'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
-      }
+        "Content-Type":      "application/json",
+        "X-RapidAPI-Key":    process.env.JUDGE0_API_KEY,
+        "X-RapidAPI-Host":   "judge0-ce.p.rapidapi.com",
+      },
     }
   );
-  return response.data;
-};
 
-module.exports = {
-  runCode,
-  getLanguages,
-  getSubmissionStatus,
-  healthCheck
-};
+  const token = submitResponse.data.token;
+
+  if (!token) {
+    res.status(502);
+    throw new Error("Failed to get submission token from Judge0");
+  }
+
+  // Step 2 — Poll until Judge0 finishes (status id > 2 means done)
+  let result = null;
+  let attempts = 0;
+  const maxAttempts = 10;
+
+  while (attempts < maxAttempts) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const pollResponse = await axios.get(
+      `${process.env.JUDGE0_API_URL}/submissions/${token}?base64_encoded=false`,
+      {
+        headers: {
+          "X-RapidAPI-Key":  process.env.JUDGE0_API_KEY,
+          "X-RapidAPI-Host": "judge0-ce.p.rapidapi.com",
+        },
+      }
+    );
+
+    result = pollResponse.data;
+
+    // Status id 1 = In Queue, 2 = Processing, >2 = Done
+    if (result.status && result.status.id > 2) {
+      break;
+    }
+
+    attempts++;
+  }
+
+  if (!result) {
+    res.status(504);
+    throw new Error("Code execution timed out");
+  }
+
+  // Step 3 — Return clean response
+  res.json({
+    status:      result.status?.description || "Unknown",
+    stdout:      result.stdout      || null,
+    stderr:      result.stderr      || null,
+    compile_output: result.compile_output || null,
+    time:        result.time        || null,
+    memory:      result.memory      || null,
+  });
+});
+
+module.exports = { runCode };
 === END ===
 
 === PATH: backend/routes/userRoutes.js ===
@@ -1456,39 +1394,14 @@ module.exports = router;
 === END ===
 
 === PATH: backend/routes/codeRoutes.js ===
-const express = require('express');
-const { protect } = require('../middleware/authMiddleware');
-const {
-  runCode,
-  getLanguages,
-  getSubmissionStatus,
-  healthCheck
-} = require('../controllers/codeController');
-
+const express = require("express");
 const router = express.Router();
+const { runCode } = require("../controllers/codeController");
+const { protect } = require("../middleware/authMiddleware");
 
-// All routes are protected
 router.use(protect);
 
-// @desc    Run code via Judge0 API
-// @route   POST /api/code/run
-// @access  Private
-router.post('/run', runCode);
-
-// @desc    Get supported languages
-// @route   GET /api/code/languages
-// @access  Private
-router.get('/languages', getLanguages);
-
-// @desc    Get submission status
-// @route   GET /api/code/submissions/:token
-// @access  Private
-router.get('/submissions/:token', getSubmissionStatus);
-
-// @desc    Health check for code execution service
-// @route   GET /api/code/health
-// @access  Private
-router.get('/health', healthCheck);
+router.post("/run", runCode);
 
 module.exports = router;
 === END ===
@@ -1546,5 +1459,5 @@ ALLOWED_ORIGINS=http://localhost:5173
 
 # Judge0 API Configuration
 JUDGE0_API_URL=https://judge0-ce.p.rapidapi.com
-JUDGE0_API_KEY=your_rapidapi_key_here
+JUDGE0_API_KEY=05f60c86b7msh3c8125868613fe3p175c8ejsn326dd2847030
 === END ===
