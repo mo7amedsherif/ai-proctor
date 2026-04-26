@@ -26,7 +26,6 @@ app.use("/api/users",         require("./routes/userRoutes"));
 app.use("/api/exams",         require("./routes/examRoutes"));
 app.use("/api/results",       require("./routes/resultRoutes"));
 app.use("/api/cheating-logs", require("./routes/cheatingLogRoutes"));
-app.use("/api/code", require("./routes/codeRoutes"));
 
 app.use(errorHandler);
 
@@ -1149,110 +1148,6 @@ module.exports = {
 };
 === END ===
 
-=== PATH: backend/controllers/codeController.js ===
-const asyncHandler = require("express-async-handler");
-const axios = require("axios");
-
-// Judge0 language ID map
-const LANGUAGE_IDS = {
-  python:     71,
-  javascript: 63,
-  java:       62,
-  cpp:        54,
-  c:          50,
-};
-
-// @desc   Submit code to Judge0 and return result
-// @route  POST /api/code/run
-// @access Private (any authenticated user)
-const runCode = asyncHandler(async (req, res) => {
-  const { code, language, stdin } = req.body;
-
-  if (!code || !language) {
-    res.status(400);
-    throw new Error("Please provide code and language");
-  }
-
-  const languageId = LANGUAGE_IDS[language.toLowerCase()];
-
-  if (!languageId) {
-    res.status(400);
-    throw new Error(
-      `Unsupported language '${language}'. Supported: ${Object.keys(LANGUAGE_IDS).join(", ")}`
-    );
-  }
-
-  // Step 1 — Submit code to Judge0 (returns a token)
-  const submitResponse = await axios.post(
-    `${process.env.JUDGE0_API_URL}/submissions?base64_encoded=false&wait=false`,
-    {
-      source_code: code,
-      language_id: languageId,
-      stdin: stdin || "",
-    },
-    {
-      headers: {
-        "Content-Type":      "application/json",
-        "X-RapidAPI-Key":    process.env.JUDGE0_API_KEY,
-        "X-RapidAPI-Host":   "judge0-ce.p.rapidapi.com",
-      },
-    }
-  );
-
-  const token = submitResponse.data.token;
-
-  if (!token) {
-    res.status(502);
-    throw new Error("Failed to get submission token from Judge0");
-  }
-
-  // Step 2 — Poll until Judge0 finishes (status id > 2 means done)
-  let result = null;
-  let attempts = 0;
-  const maxAttempts = 10;
-
-  while (attempts < maxAttempts) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    const pollResponse = await axios.get(
-      `${process.env.JUDGE0_API_URL}/submissions/${token}?base64_encoded=false`,
-      {
-        headers: {
-          "X-RapidAPI-Key":  process.env.JUDGE0_API_KEY,
-          "X-RapidAPI-Host": "judge0-ce.p.rapidapi.com",
-        },
-      }
-    );
-
-    result = pollResponse.data;
-
-    // Status id 1 = In Queue, 2 = Processing, >2 = Done
-    if (result.status && result.status.id > 2) {
-      break;
-    }
-
-    attempts++;
-  }
-
-  if (!result) {
-    res.status(504);
-    throw new Error("Code execution timed out");
-  }
-
-  // Step 3 — Return clean response
-  res.json({
-    status:      result.status?.description || "Unknown",
-    stdout:      result.stdout      || null,
-    stderr:      result.stderr      || null,
-    compile_output: result.compile_output || null,
-    time:        result.time        || null,
-    memory:      result.memory      || null,
-  });
-});
-
-module.exports = { runCode };
-=== END ===
-
 === PATH: backend/routes/userRoutes.js ===
 const express = require("express");
 const router = express.Router();
@@ -1393,19 +1288,6 @@ router.get("/exam/:examId/student/:studentId",
 module.exports = router;
 === END ===
 
-=== PATH: backend/routes/codeRoutes.js ===
-const express = require("express");
-const router = express.Router();
-const { runCode } = require("../controllers/codeController");
-const { protect } = require("../middleware/authMiddleware");
-
-router.use(protect);
-
-router.post("/run", runCode);
-
-module.exports = router;
-=== END ===
-
 === PATH: backend/utils/generateToken.js ===
 const jwt = require("jsonwebtoken");
 
@@ -1456,8 +1338,4 @@ PORT=5000
 MONGO_URI=mongodb://127.0.0.1:27017/ai-proctor
 JWT_SECRET=all password 15891741 for $%&!@ god protection 
 ALLOWED_ORIGINS=http://localhost:5173
-
-# Judge0 API Configuration
-JUDGE0_API_URL=https://judge0-ce.p.rapidapi.com
-JUDGE0_API_KEY=05f60c86b7msh3c8125868613fe3p175c8ejsn326dd2847030
 === END ===
